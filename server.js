@@ -166,6 +166,7 @@ app.get("/", serveFrontend("index.html"));
 app.get("/index.html", serveFrontend("index.html"));
 app.get("/style.css", serveFrontend("style.css"));
 app.get("/script.js", serveFrontend("script.js"));
+
 app.get("/api/health", asyncRoute(async (req, res) => {
     await db.query("SELECT 1");
     res.json({ status: "ok", database: "connected" });
@@ -220,11 +221,13 @@ app.get("/api/auth/me", authenticate, asyncRoute(async (req, res) => {
 app.get("/api/users/me", authenticate, asyncRoute(async (req, res) => {
     res.json({ user: req.user });
 }));
+
 app.patch("/api/users/me", authenticate, asyncRoute(async (req, res) => {
     const name = requiredText(req.body.name, "Name", 100);
     await db.execute("UPDATE users SET name = ? WHERE id = ?", [name, req.user.id]);
     res.json({ user: await getUserById(db, req.user.id) });
 }));
+
 app.get("/api/users", authenticate, requireAdmin, asyncRoute(async (req, res) => {
     const [users] = await db.execute(
         `SELECT u.id, u.name, u.email, u.role, u.created_at,
@@ -245,6 +248,7 @@ app.get("/api/vehicles", authenticate, asyncRoute(async (req, res) => {
     );
     res.json({ vehicles });
 }));
+
 app.post("/api/vehicles", authenticate, asyncRoute(async (req, res) => {
     const registrationNumber = requiredText(req.body.registrationNumber, "Registration number", 20).toUpperCase();
     const make = requiredText(req.body.make, "Make", 60);
@@ -276,6 +280,7 @@ app.delete("/api/vehicles/:id", authenticate, asyncRoute(async (req, res) => {
     }
     res.status(204).end();
 }));
+
 app.get("/api/admin/vehicles", authenticate, requireAdmin, asyncRoute(async (req, res) => {
     const [vehicles] = await db.execute(
         `SELECT v.id, v.registration_number, v.make, v.model, v.vehicle_type,
@@ -312,6 +317,7 @@ app.get("/api/parking-slots", authenticate, asyncRoute(async (req, res) => {
     );
     res.json({ slots });
 }));
+
 app.post("/api/parking-slots", authenticate, requireAdmin, asyncRoute(async (req, res) => {
     const slotNumber = requiredText(req.body.slotNumber, "Slot number", 10).toUpperCase();
     const zone = requiredText(req.body.zone, "Zone", 50);
@@ -329,6 +335,7 @@ app.post("/api/parking-slots", authenticate, requireAdmin, asyncRoute(async (req
         throw error;
     }
 }));
+
 app.patch("/api/parking-slots/:id", authenticate, requireAdmin, asyncRoute(async (req, res) => {
     const id = positiveId(req.params.id, "Slot ID");
     const [currentRows] = await db.execute("SELECT * FROM parking_slots WHERE id = ?", [id]);
@@ -358,6 +365,7 @@ app.patch("/api/parking-slots/:id", authenticate, requireAdmin, asyncRoute(async
     }
     res.json({ slot: { id, slotNumber, zone, slotType, status } });
 }));
+
 app.delete("/api/parking-slots/:id", authenticate, requireAdmin, asyncRoute(async (req, res) => {
     const id = positiveId(req.params.id, "Slot ID");
     try {
@@ -419,6 +427,7 @@ app.post("/api/parking-requests", authenticate, asyncRoute(async (req, res) => {
     });
     res.status(201).json({ request, message: "Parking booked and automatically allocated. Demo payment recorded." });
 }));
+
 app.get("/api/parking-requests", authenticate, asyncRoute(async (req, res) => {
     const [requests] = await db.execute(
         `SELECT pr.id, pr.status, pr.requested_at, pr.reviewed_at, pr.user_id,
@@ -434,6 +443,7 @@ app.get("/api/parking-requests", authenticate, asyncRoute(async (req, res) => {
     );
     res.json({ requests });
 }));
+
 app.delete("/api/parking-requests/:id", authenticate, asyncRoute(async (req, res) => {
     const id = positiveId(req.params.id, "Request ID");
     const [result] = await db.execute(
@@ -442,48 +452,6 @@ app.delete("/api/parking-requests/:id", authenticate, asyncRoute(async (req, res
     );
     if (!result.affectedRows) throw new HttpError(409, "Only your pending requests can be cancelled.");
     res.json({ message: "Request cancelled." });
-}));
-
-app.post("/api/admin/parking-requests/:id/approve", authenticate, requireAdmin, asyncRoute(async (req, res) => {
-    const requestId = positiveId(req.params.id, "Request ID");
-    const slotId = req.body.slotId === undefined ? null : positiveId(req.body.slotId, "Slot ID");
-    const allocation = await withTransaction(async (connection) => {
-        const [requests] = await connection.execute("SELECT * FROM parking_requests WHERE id = ? FOR UPDATE", [requestId]);
-        const request = requests[0];
-        if (!request) throw new HttpError(404, "Parking request not found.");
-        if (request.status !== "PENDING") throw new HttpError(409, "This request has already been reviewed.");
-        const assignedSlotId = slotId || request.parking_slot_id;
-        const [slots] = await connection.execute("SELECT id, status FROM parking_slots WHERE id = ? FOR UPDATE", [assignedSlotId]);
-        if (!slots.length) throw new HttpError(404, "Parking slot not found.");
-        if (slots[0].status !== "AVAILABLE") throw new HttpError(409, "The selected slot is not available.");
-        const [active] = await connection.execute("SELECT id FROM allocations WHERE user_id = ? AND status = 'ACTIVE' LIMIT 1", [request.user_id]);
-        if (active.length) throw new HttpError(409, "This user already has an active allocation.");
-
-        await connection.execute(
-            "UPDATE parking_requests SET parking_slot_id = ?, status = 'APPROVED', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ?",
-            [assignedSlotId, req.user.id, requestId]
-        );
-        const [result] = await connection.execute(
-            "INSERT INTO allocations (request_id, user_id, vehicle_id, parking_slot_id) VALUES (?, ?, ?, ?)",
-            [requestId, request.user_id, request.vehicle_id, assignedSlotId]
-        );
-        await connection.execute("UPDATE parking_slots SET status = 'RESERVED' WHERE id = ?", [assignedSlotId]);
-        await connection.execute(
-            "UPDATE parking_requests SET status = 'REJECTED', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE parking_slot_id = ? AND id <> ? AND status = 'PENDING'",
-            [req.user.id, assignedSlotId, requestId]
-        );
-        return { id: result.insertId, requestId, slotId: assignedSlotId, status: "ACTIVE" };
-    });
-    res.json({ allocation, message: "Request approved and slot reserved." });
-}));
-app.post("/api/admin/parking-requests/:id/reject", authenticate, requireAdmin, asyncRoute(async (req, res) => {
-    const id = positiveId(req.params.id, "Request ID");
-    const [result] = await db.execute(
-        "UPDATE parking_requests SET status = 'REJECTED', reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ? WHERE id = ? AND status = 'PENDING'",
-        [req.user.id, id]
-    );
-    if (!result.affectedRows) throw new HttpError(404, "Pending request not found.");
-    res.json({ message: "Request rejected." });
 }));
 
 app.get("/api/allocations", authenticate, asyncRoute(async (req, res) => {
@@ -500,6 +468,7 @@ app.get("/api/allocations", authenticate, asyncRoute(async (req, res) => {
     );
     res.json({ allocations });
 }));
+
 app.post("/api/allocations/:id/cancel", authenticate, asyncRoute(async (req, res) => {
     const id = positiveId(req.params.id, "Allocation ID");
     await withTransaction(async (connection) => {
@@ -518,6 +487,7 @@ app.post("/api/allocations/:id/cancel", authenticate, asyncRoute(async (req, res
     });
     res.json({ message: "Allocation cancelled." });
 }));
+
 app.patch("/api/admin/allocations/:id/slot", authenticate, requireAdmin, asyncRoute(async (req, res) => {
     const id = positiveId(req.params.id, "Allocation ID");
     const newSlotId = positiveId(req.body.slotId, "Slot ID");
@@ -555,6 +525,7 @@ app.get("/api/admin/dashboard", authenticate, requireAdmin, asyncRoute(async (re
 }));
 
 app.use((req, res, next) => next(new HttpError(404, "Endpoint not found.")));
+
 app.use((error, req, res, next) => {
     if (res.headersSent) return next(error);
     if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
@@ -565,15 +536,13 @@ app.use((error, req, res, next) => {
     res.status(status).json({ error: status >= 500 ? "Something went wrong. Please try again." : error.message });
 });
 
-db.query("SELECT 1").then(() => {
-    return autoAllocatePendingRequests().then((allocatedCount) => {
-        if (allocatedCount) console.log(`Automatically allocated ${allocatedCount} pending booking(s).`);
-        app.listen(PORT, () => console.log(`ParkFlow is running at http://localhost:${PORT}`));
+db.query("SELECT 1").then(async () => {
+    const allocatedCount = await autoAllocatePendingRequests();
+    if (allocatedCount) console.log(`Automatically allocated ${allocatedCount} pending booking(s).`);
+    app.listen(PORT, "0.0.0.0", () => {
+        console.log(`ParkFlow is running on port ${PORT}`);
     });
 }).catch((error) => {
     console.error("MySQL connection failed:", error.message);
     process.exitCode = 1;
-});
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
 });
